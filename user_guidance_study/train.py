@@ -9,12 +9,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+### Code extension and modification by M.Sc. Zdravko Marinov, Karlsuhe Institute of Techonology ###
+### zdravko.marinov@kit.edu ###
+
+
 import argparse
 import logging
 import os
 import sys
 import time
-import glob
 
 # Things needed to debug the Interaction class
 import resource
@@ -24,18 +27,8 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (4096, rlimit[1]))
 import torch
 from utils.interaction import Interaction
 
-from utils.transforms import (
-    AddGuidanceSignalDeepEditd,
-    AddRandomGuidanceDeepEditd,
-    FindDiscrepancyRegionsDeepEditd,
-    NormalizeLabelsInDatasetd,
-    FindAllValidSlicesMissingLabelsd,
-    AddInitialSeedPointMissingLabelsd,
-    SplitPredsLabeld,
-)
-from monai.data import partition_dataset
-from monai.data.dataloader import DataLoader
-from monai.data.dataset import PersistentDataset
+from utils.utils import get_pre_transforms, get_click_transforms, get_post_transforms, get_loaders
+
 from monai.engines import SupervisedEvaluator, SupervisedTrainer
 from monai.handlers import (
     CheckpointSaver,
@@ -49,25 +42,10 @@ from monai.handlers import (
 from monai.inferers import SimpleInferer
 from monai.losses import DiceCELoss
 from utils.dynunet import DynUNet
-from monai.transforms import (
-    Activationsd,
-    AsDiscreted,
-    Compose,
-    EnsureChannelFirstd,
-    LoadImaged,
-    Orientationd,
-    Spacingd,
-    RandFlipd,
-    RandShiftIntensityd,
-    RandRotate90d,
-    Resized,
-    ScaleIntensityRanged,
-    DivisiblePadd,
-    ToNumpyd,
-    ToTensord,
-)
-from monai.utils import set_determinism
 
+from monai.utils import set_determinism
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def get_network(network, labels, args):
     network = DynUNet(
@@ -86,158 +64,6 @@ def get_network(network, labels, args):
     return network
 
 
-# MSD Spleen
-def get_pre_transforms(labels, device, args):
-    spacing = [2 * 0.79296899, 2 * 0.79296899, 5.        ] # 2-factor because of the spatial size
-    t_train = [
-        LoadImaged(keys=("image", "label"), reader="ITKReader"),
-        EnsureChannelFirstd(keys=("image", "label")),
-        NormalizeLabelsInDatasetd(keys="label", label_names=labels),
-        Orientationd(keys=["image", "label"], axcodes="RAS"),
-        Spacingd(keys=["image", "label"], pixdim=spacing),
-        ScaleIntensityRanged(keys="image", a_min=-224, a_max=212, b_min=0.0, b_max=1.0, clip=True), # 0.05 and 99.95 percentiles of the spleen HUs
-        DivisiblePadd(keys=["image", "label"], k=64, value=0), # Needed for DynUNet
-        ### Random Transforms ###
-        RandFlipd(keys=("image", "label"), spatial_axis=[0], prob=0.10),
-        RandFlipd(keys=("image", "label"), spatial_axis=[1], prob=0.10),
-        RandFlipd(keys=("image", "label"), spatial_axis=[2], prob=0.10),
-        RandRotate90d(keys=("image", "label"), prob=0.10, max_k=3),
-        RandShiftIntensityd(keys="image", offsets=0.10, prob=0.50),
-        Resized(keys=("image", "label"), spatial_size=[256, 256, -1], mode=("area", "nearest")), # downsampled from 512x512x-1 to fit into memory
-        # Transforms for click simulation
-        FindAllValidSlicesMissingLabelsd(keys="label", sids="sids"),
-        AddInitialSeedPointMissingLabelsd(keys="label", guidance="guidance", sids="sids"),
-        ToTensord(keys=("image", "guidance"), device=device),
-        AddGuidanceSignalDeepEditd(keys="image",
-                                    guidance="guidance",
-                                    sigma=args.sigma,
-                                    disks=args.disks,
-                                    edt=args.edt,
-                                    gdt=args.gdt,
-                                    gdt_th=args.gdt_th,
-                                    exp_geos=args.exp_geos,
-                                    adaptive_sigma=args.adaptive_sigma,
-                                    device=device, spacing=spacing),
-        ToTensord(keys=("image", "label"), device=torch.device('cpu')), # TODO: check why we need this on the CPU
-    ]
-    t_val = [
-        LoadImaged(keys=("image", "label"), reader="ITKReader"),
-        EnsureChannelFirstd(keys=("image", "label")),
-        NormalizeLabelsInDatasetd(keys="label", label_names=labels),
-        Orientationd(keys=["image", "label"], axcodes="RAS"),
-        Spacingd(keys=["image", "label"], pixdim=spacing),
-        ScaleIntensityRanged(keys="image", a_min=-224, a_max=212, b_min=0.0, b_max=1.0, clip=True), # 0.05 and 99.95 percentiles of the spleen HUs
-        DivisiblePadd(keys=["image", "label"], k=64, value=0), # Needed for DynUNet
-        Resized(keys=("image", "label"), spatial_size=[256, 256, -1], mode=("area", "nearest")), # downsampled from 512x512x-1 to fit into memory
-        # Transforms for click simulation
-        FindAllValidSlicesMissingLabelsd(keys="label", sids="sids"),
-        AddInitialSeedPointMissingLabelsd(keys="label", guidance="guidance", sids="sids"),
-        ToTensord(keys=("image", "guidance"), device=device),
-        AddGuidanceSignalDeepEditd(keys="image",
-                                    guidance="guidance",
-                                    sigma=args.sigma,
-                                    disks=args.disks,
-                                    edt=args.edt,
-                                    gdt=args.gdt,
-                                    gdt_th=args.gdt_th,
-                                    exp_geos=args.exp_geos,
-                                    adaptive_sigma=args.adaptive_sigma,
-                                    device=device, spacing=spacing),
-        ToTensord(keys=("image", "label"), device=torch.device('cpu')),
-    ]
-
-    return Compose(t_train), Compose(t_val)
-
-
-def get_click_transforms(device, args):
-    spacing = [2 * 0.79296899, 2 * 0.79296899, 5.        ] # 2-factor because of the spatial size
-
-    t = [
-        Activationsd(keys="pred", softmax=True),
-        AsDiscreted(keys="pred", argmax=True),
-        ToNumpyd(keys=("image", "label", "pred")),
-        # Transforms for click simulation
-        FindDiscrepancyRegionsDeepEditd(keys="label", pred="pred", discrepancy="discrepancy"),
-        AddRandomGuidanceDeepEditd(
-            keys="NA",
-            guidance="guidance",
-            discrepancy="discrepancy",
-            probability="probability",
-        ),
-        ToTensord(keys=("image", "guidance"), device=device),
-        AddGuidanceSignalDeepEditd(keys="image",
-                                    guidance="guidance",
-                                    sigma=args.sigma,
-                                    disks=args.disks,
-                                    edt=args.edt,
-                                    gdt=args.gdt,
-                                    gdt_th=args.gdt_th,
-                                    exp_geos=args.exp_geos,
-                                    adaptive_sigma=args.adaptive_sigma,
-                                    device=device, spacing=spacing),        #
-        ToTensord(keys=("image", "label"), device=torch.device('cpu')),
-    ]
-
-    return Compose(t)
-
-
-def get_post_transforms(labels):
-    t = [
-        Activationsd(keys="pred", softmax=True),
-        AsDiscreted(
-            keys=("pred", "label"),
-            argmax=(True, False),
-            to_onehot=(len(labels), len(labels)),
-        ),
-        # This transform is to check dice score per segment/label
-        SplitPredsLabeld(keys="pred"),
-    ]
-    return Compose(t)
-
-
-def get_loaders(args, pre_transforms_train, pre_transforms_val):
-    all_images = sorted(glob.glob(os.path.join(args.input, "imagesTr", "*.nii.gz")))
-    all_labels = sorted(glob.glob(os.path.join(args.input, "labelsTr", "*.nii.gz")))
-
-    all_images = all_images
-    all_labels = all_labels
-    datalist = [{"image": image_name, "label": label_name} for image_name, label_name in
-                zip(all_images, all_labels)]
-
-    datalist = datalist[0: args.limit] if args.limit else datalist
-    total_l = len(datalist)
-
-    train_datalist, val_datalist = partition_dataset(
-        datalist,
-        ratios=[args.split, (1 - args.split)],
-        shuffle=True,
-        seed=args.seed,
-    )
-
-    train_ds = PersistentDataset(
-        train_datalist, pre_transforms_train, cache_dir=args.cache_dir
-    )
-    train_loader = DataLoader(
-        train_ds, shuffle=True, num_workers=2, batch_size=1, multiprocessing_context='spawn',
-    )
-    logging.info(
-        "{}:: Total Records used for Training is: {}/{}".format(
-            args.gpu, len(train_ds), total_l
-        )
-    )
-
-    val_ds = PersistentDataset(val_datalist, pre_transforms_val, cache_dir=args.cache_dir)
-
-    val_loader = DataLoader(val_ds, num_workers=2, batch_size=1, multiprocessing_context='spawn')
-    logging.info(
-        "{}:: Total Records used for Validation is: {}/{}".format(
-            args.gpu, len(val_ds), total_l
-        )
-    )
-
-    return train_loader, val_loader
-
-
 def create_trainer(args):
 
     set_determinism(seed=args.seed)
@@ -253,11 +79,14 @@ def create_trainer(args):
     # define training components
     network = get_network(args.network, args.labels, args).to(device)
 
+    print('Number of parameters:', f"{count_parameters(network):,}")
+
     if args.resume:
         logging.info("{}:: Loading Network...".format(args.gpu))
-        map_location = {f"cuda:{args.gpu}": f"cuda:{args.gpu}"}
+        map_location = {f"cuda:{args.gpu}": "cuda:{}".format(args.gpu)}
+
         network.load_state_dict(
-            torch.load(args.model_filepath, map_location=map_location)
+            torch.load(args.model_filepath, map_location=map_location)['net']
         )
 
     # define event-handlers for engine
@@ -283,7 +112,7 @@ def create_trainer(args):
             all_val_metrics[key_label + "_dice"] = MeanDice(
                 output_transform=from_engine(["pred_" + key_label, "label_" + key_label]), include_background=False
             )
-            
+
     evaluator = SupervisedEvaluator(
         device=device,
         val_data_loader=val_loader,
@@ -360,7 +189,7 @@ def create_trainer(args):
         key_train_metric=all_train_metrics,
         train_handlers=train_handlers,
     )
-    return trainer
+    return trainer, evaluator
 
 
 def run(args):
@@ -389,7 +218,7 @@ def run(args):
         )
         os.makedirs(args.output, exist_ok=True)
 
-    trainer = create_trainer(args)
+    trainer, evaluator = create_trainer(args)
 
     start_time = time.time()
     trainer.run()
@@ -413,7 +242,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     # Data
-    parser.add_argument("-i", "--input", default="../../tutorials/deepedit_zrrr/ignite/Task09_Spleen/")
+    parser.add_argument("-i", "--input", default="../../AutoPET_deepedit/AutoPET")
     parser.add_argument("-o", "--output", default="output/test")
     parser.add_argument("--cache_dir", type=str, default='cache/test')
     parser.add_argument("-x", "--split", type=float, default=0.8)
@@ -425,11 +254,12 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
 
     # Model
-    parser.add_argument("-n", "--network", default="dynunet", choices=["dynunet", "unetr"])
+    parser.add_argument("-n", "--network", default="dynunet", choices=["dynunet"])
     parser.add_argument("-r", "--resume", default=False, action='store_true')
 
     # Training
     parser.add_argument("-a", "--amp", default=False, action='store_true')
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("-e", "--epochs", type=int, default=100)
     parser.add_argument("-lr", "--learning_rate", type=float, default=0.0001)
     parser.add_argument("--model_weights", type=str, default='None')
@@ -459,13 +289,13 @@ def main():
     parser.add_argument("--conv1s", default=False, action='store_true')
     parser.add_argument("--adaptive_sigma", default=False, action='store_true')
 
+    parser.add_argument("--dataset", default="MSD_Spleen")
 
     args = parser.parse_args()
     # For single label using one of the Medical Segmentation Decathlon
     args.labels = {'spleen': 1,
                    'background': 0
                    }
-
     # Restoring previous model if resume flag is True
     args.model_filepath = args.model_weights
     if args.best_val_weights:
